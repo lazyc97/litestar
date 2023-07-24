@@ -37,13 +37,13 @@ async def test_rate_limiting(unit: DurationUnit) -> None:
         assert response.status_code == HTTP_200_OK
         cached_value = await store.get(cache_key)
         assert cached_value
-        cache_object = CacheObject(**decode_json(cached_value))
-        assert len(cache_object.history) == 1
+        cache_histories = decode_json(cached_value, type_=dict[DurationUnit, CacheObject])
+        assert len(cache_histories[unit].history) == 1
 
         assert response.headers.get(config.rate_limit_policy_header_key) == f"1; w={DURATION_VALUES[unit]}"
         assert response.headers.get(config.rate_limit_limit_header_key) == "1"
         assert response.headers.get(config.rate_limit_remaining_header_key) == "0"
-        assert response.headers.get(config.rate_limit_reset_header_key) == str(int(time()) - cache_object.reset)
+        assert response.headers.get(config.rate_limit_reset_header_key) == str(cache_histories[unit].reset - int(time()))
 
         frozen_time.tick(DURATION_VALUES[unit] - 1)  # type: ignore[arg-type]
 
@@ -52,7 +52,7 @@ async def test_rate_limiting(unit: DurationUnit) -> None:
         assert response.headers.get(config.rate_limit_policy_header_key) == f"1; w={DURATION_VALUES[unit]}"
         assert response.headers.get(config.rate_limit_limit_header_key) == "1"
         assert response.headers.get(config.rate_limit_remaining_header_key) == "0"
-        assert response.headers.get(config.rate_limit_reset_header_key) == str(int(time()) - cache_object.reset)
+        assert response.headers.get(config.rate_limit_reset_header_key) == str(cache_histories[unit].reset - int(time()))
 
         frozen_time.tick(1)  # type: ignore[arg-type]
 
@@ -109,11 +109,13 @@ async def test_reset() -> None:
         assert response.status_code == HTTP_200_OK
         cached_value = await store.get(cache_key)
         assert cached_value
-        cache_object = CacheObject(**decode_json(cached_value))
+        cache_histories = decode_json(cached_value, type_=dict[DurationUnit, CacheObject])
+        assert cache_histories
+        cache_object = cache_histories["second"]
         assert cache_object.reset == int(time() + 1)
 
         cache_object.reset -= 2
-        await store.set(cache_key, encode_json(cache_object))
+        await store.set(cache_key, encode_json(cache_histories))
 
         response = client.get("/")
         assert response.status_code == HTTP_200_OK

@@ -55,8 +55,9 @@ class RateLimitMiddleware(AbstractMiddleware):
         )
         self.check_throttle_handler = cast("Callable[[Request], Awaitable[bool]] | None", config.check_throttle_handler)
         self.config = config
-        self.max_requests: int = config.rate_limit[1]
-        self.unit: DurationUnit = config.rate_limit[0]
+        self.limit_dict = config.get_rate_limit_dict()
+        self.sorted_units = sorted(self.limit_dict.keys(), key=lambda d: DURATION_VALUES[d])
+        self.cache_expires_in = max(DURATION_VALUES[unit] for unit in self.sorted_units)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """ASGI callable.
@@ -74,25 +75,25 @@ class RateLimitMiddleware(AbstractMiddleware):
         store = self.config.get_store_from_app(app)
         if await self.should_check_request(request=request):
             key = self.cache_key_from_request(request=request)
-            cache_object = await self.retrieve_cached_history(key, store)
-            if len(cache_object.history) >= self.max_requests:
+            cache_histories = await self.retrieve_cached_histories(key, store)
+            if self.is_too_many_request(cache_histories=cache_histories):
                 raise TooManyRequestsException(
-                    headers=self.create_response_headers(cache_object=cache_object)
+                    headers=self.create_response_headers(cache_histories=cache_histories)
                     if self.config.set_rate_limit_headers
                     else None
                 )
-            await self.set_cached_history(key=key, cache_object=cache_object, store=store)
+            cache_histories = await self.set_cached_histories(key=key, cache_histories=cache_histories, store=store)
             if self.config.set_rate_limit_headers:
-                send = self.create_send_wrapper(send=send, cache_object=cache_object)
+                send = self.create_send_wrapper(send=send, cache_histories=cache_histories)
 
         await self.app(scope, receive, send)  # pyright: ignore
 
-    def create_send_wrapper(self, send: Send, cache_object: CacheObject) -> Send:
+    def create_send_wrapper(self, send: Send, cache_histories: dict[DurationUnit, CacheObject]) -> Send:
         """Create a ``send`` function that wraps the original send to inject response headers.
 
         Args:
             send: The ASGI send function.
-            cache_object: A StorageObject instance.
+            cache_histories: A :class:`dict[DurationUnit, CacheObject]`.
 
         Returns:
             Send wrapper callable.
@@ -110,7 +111,7 @@ class RateLimitMiddleware(AbstractMiddleware):
             if message["type"] == "http.response.start":
                 message.setdefault("headers", [])
                 headers = MutableScopeHeaders(message)
-                for key, value in self.create_response_headers(cache_object=cache_object).items():
+                for key, value in self.create_response_headers(cache_histories=cache_histories).items():
                     headers.add(key, value)
             await send(message)
 
@@ -136,7 +137,7 @@ class RateLimitMiddleware(AbstractMiddleware):
 
         return f"{type(self).__name__}::{identifier}"
 
-    async def retrieve_cached_history(self, key: str, store: Store) -> CacheObject:
+    async def retrieve_cached_histories(self, key: str, store: Store) -> dict[DurationUnit, CacheObject]:
         """Retrieve a list of time stamps for the given duration unit.
 
         Args:
@@ -144,35 +145,53 @@ class RateLimitMiddleware(AbstractMiddleware):
             store: A :class:`Store <.stores.base.Store>`
 
         Returns:
-            An :class:`CacheObject`.
+            An :class:`dict[DurationUnit, CacheObject]`.
         """
-        duration = DURATION_VALUES[self.unit]
         now = int(time())
+        histories = {}
+        for unit in self.limit_dict:
+            histories[unit] = CacheObject(history=[], reset=now + DURATION_VALUES[unit])
+
         cached_string = await store.get(key)
+        cache_histories: dict[DurationUnit, CacheObject] = {}
         if cached_string:
-            cache_object = CacheObject(**decode_json(cached_string))
-            if cache_object.reset <= now:
-                return CacheObject(history=[], reset=now + duration)
+            cache_histories = decode_json(cached_string, type_=dict[DurationUnit, CacheObject])
 
-            while cache_object.history and cache_object.history[-1] <= now - duration:
-                cache_object.history.pop()
-            return cache_object
+            for unit in self.sorted_units:
+                cache_object = cache_histories[unit]
+                if cache_object.reset <= now:
+                    continue
 
-        return CacheObject(history=[], reset=now + duration)
+                duration = DURATION_VALUES[unit]
+                while cache_object.history and cache_object.history[-1] <= now - duration:
+                    cache_object.history.pop()
+                histories[unit] = cache_object
 
-    async def set_cached_history(self, key: str, cache_object: CacheObject, store: Store) -> None:
-        """Store history extended with the current timestamp in cache.
+        return histories
+
+    def is_too_many_request(self, cache_histories: dict[DurationUnit, CacheObject]) -> bool:
+        return any(len(cache_histories[unit].history) >= self.limit_dict[unit] for unit in cache_histories)
+
+    async def set_cached_histories(self, key: str, cache_histories: dict[DurationUnit, CacheObject], store: Store) -> dict[DurationUnit, CacheObject]:
+        """Store histories extended with the current timestamp in cache and returns the extended histories.
 
         Args:
             key: Cache key.
-            cache_object: A :class:`CacheObject`.
+            cache_histories: A :class:`dict[DurationUnit, CacheObject]`.
             store: A :class:`Store <.stores.base.Store>`
 
         Returns:
-            None
+            The histories with current timestamp included.
         """
-        cache_object.history = [int(time()), *cache_object.history]
-        await store.set(key, encode_json(cache_object), expires_in=DURATION_VALUES[self.unit])
+        extended_histories = {}
+        for unit, cache_object in cache_histories.items():
+            extended_histories[unit] = CacheObject(
+                history=[int(time()), *cache_object.history],
+                reset=cache_object.reset
+            )
+
+        await store.set(key, encode_json(extended_histories), expires_in=self.cache_expires_in)
+        return extended_histories
 
     async def should_check_request(self, request: Request[Any, Any, Any]) -> bool:
         """Return a boolean indicating if a request should be checked for rate limiting.
@@ -187,27 +206,37 @@ class RateLimitMiddleware(AbstractMiddleware):
             return await self.check_throttle_handler(request)
         return True
 
-    def create_response_headers(self, cache_object: CacheObject) -> dict[str, str]:
+    def create_response_headers(self, cache_histories: dict[DurationUnit, CacheObject]) -> dict[str, str]:
         """Create ratelimit response headers.
 
         Notes:
             * see the `IETF RateLimit draft <https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/>_`
 
         Args:
-            cache_object:A :class:`CacheObject`.
+            cache_histories:A :class:`dict[DurationUnit, CacheObject]`.
 
         Returns:
             A dict of http headers.
         """
-        remaining_requests = str(
-            len(cache_object.history) - self.max_requests if len(cache_object.history) <= self.max_requests else 0
-        )
+        remaining_requests_list = [
+            (max_requests - len(cache_histories[unit].history), unit)
+            if len(cache_histories[unit].history) <= max_requests else 0
+            for unit, max_requests in self.limit_dict.items()
+        ]
+
+        main_policy = min(remaining_requests_list, key=lambda x: x[0])
+        main_policy_remaining_requests, main_policy_unit = main_policy
+
+        rate_limit_policy = ", ".join([
+            f"{self.limit_dict[unit]}; w={DURATION_VALUES[unit]}"
+            for unit in self.sorted_units
+        ])
 
         return {
-            self.config.rate_limit_policy_header_key: f"{self.max_requests}; w={DURATION_VALUES[self.unit]}",
-            self.config.rate_limit_limit_header_key: str(self.max_requests),
-            self.config.rate_limit_remaining_header_key: remaining_requests,
-            self.config.rate_limit_reset_header_key: str(int(time()) - cache_object.reset),
+            self.config.rate_limit_policy_header_key: rate_limit_policy,
+            self.config.rate_limit_limit_header_key: str(self.limit_dict[main_policy_unit]),
+            self.config.rate_limit_remaining_header_key: str(main_policy_remaining_requests),
+            self.config.rate_limit_reset_header_key: str(cache_histories[main_policy_unit].reset - int(time())),
         }
 
 
@@ -215,8 +244,13 @@ class RateLimitMiddleware(AbstractMiddleware):
 class RateLimitConfig:
     """Configuration for ``RateLimitMiddleware``"""
 
-    rate_limit: tuple[DurationUnit, int]
+    rate_limit: tuple[DurationUnit, int] = field(default=None)
     """A tuple containing a time unit (second, minute, hour, day) and quantity, e.g. ("day", 1) or ("minute", 5)."""
+    rate_limits: list[tuple[DurationUnit, int]] = field(default=None, )
+    """A list of tuples each containing a time unit (second, minute, hour, day) and quantity, e.g. ("day", 1) or ("minute", 5).
+    If multiple tuples with the same time unit is specified, the one with minimum quantity will apply.
+    Will include the tuple from `rate_limit` if specified.
+    """
     exclude: str | list[str] | None = field(default=None)
     """A pattern or list of patterns to skip in the rate limiting middleware."""
     exclude_opt_key: str | None = field(default=None)
@@ -241,6 +275,8 @@ class RateLimitConfig:
     """Name of the :class:`Store <.stores.base.Store>` to use"""
 
     def __post_init__(self) -> None:
+        if self.rate_limit is None and (self.rate_limits is None or len(self.rate_limits) == 0):
+            raise Exception("At least one limit should be clarified by rate_limit or rate_limits.")
         if self.check_throttle_handler:
             self.check_throttle_handler = AsyncCallable(self.check_throttle_handler)  # type: ignore
 
@@ -272,3 +308,26 @@ class RateLimitConfig:
     def get_store_from_app(self, app: Litestar) -> Store:
         """Get the store defined in :attr:`store` from an :class:`Litestar <.app.Litestar>` instance."""
         return app.stores.get(self.store)
+
+    def get_rate_limit_dict(self) -> dict[DurationUnit, int]:
+        """Returns a dict mapping from a duration unit to the maximum number of requests will be allowed.
+
+        Examples:
+            .. code-block: python
+
+                config = RateLimitConfig(rate_limit=("minute", 50), rate_limits=[("minute", 100), ("second", 5), ("second", 10)])
+                config.get_rate_limit_dict() # returns {"minute":50,"second":5}
+        """
+        limit_dict: dict[DurationUnit, int] = {}
+
+        if self.rate_limit is not None:
+            limit_dict[self.rate_limit[0]] = self.rate_limit[1]
+
+        if self.rate_limits is not None:
+            for lim in self.rate_limits:
+                if lim[0] in limit_dict:
+                    limit_dict[lim[0]] = min(limit_dict[lim[0]], lim[1])
+                else:
+                    limit_dict[lim[0]] = lim[1]
+
+        return limit_dict
